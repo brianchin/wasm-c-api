@@ -351,6 +351,15 @@ public:
     isolate_->RequestGarbageCollectionForTesting(
       v8::Isolate::kFullGarbageCollection);
 #endif
+    {
+      v8::HandleScope scope(isolate_);
+      while (handle_pool_ != nullptr) {
+        auto handle = handle_pool_;
+        handle_pool_ = reinterpret_cast<v8::Persistent<v8::Object>*>(
+          wasm_v8::foreign_get(handle->Get(isolate_)));
+        delete handle;
+      }
+    }
     context()->Exit();
     isolate_->Exit();
     isolate_->Dispose();
@@ -387,12 +396,10 @@ public:
   auto make_handle() -> v8::Persistent<v8::Object>* {
     if (handle_pool_ == nullptr) {
       static const size_t n = 100;
-      handle_pool_ = new(std::nothrow) v8::Persistent<v8::Object>[n];
-      if (!handle_pool_) return nullptr;
       for (size_t i = 0; i < n; ++i) {
-        auto next = i == n - 1 ? nullptr : &handle_pool_[i + 1];
-        auto v8_next = wasm_v8::foreign_new(isolate_, next);
-        handle_pool_[i].Reset(isolate_, v8::Local<v8::Object>::Cast(v8_next));
+        auto v8_next = wasm_v8::foreign_new(isolate_, handle_pool_);
+        handle_pool_ = new v8::Persistent<v8::Object>();
+        handle_pool_->Reset(isolate_, v8::Local<v8::Object>::Cast(v8_next));
       }
     }
     auto handle = handle_pool_;
@@ -592,6 +599,7 @@ auto ExternType::copy() const -> own<ExternType*> {
     case EXTERN_GLOBAL: return global()->copy();
     case EXTERN_TABLE: return table()->copy();
     case EXTERN_MEMORY: return memory()->copy();
+    default: assert(false);
   }
 }
 
@@ -1084,6 +1092,7 @@ auto v8_to_val(
         UNIMPLEMENTED("ref value");
       }
     }
+    default: assert(false);
   }
 }
 
@@ -1461,6 +1470,7 @@ auto Extern::type() const -> own<ExternType*> {
     case EXTERN_GLOBAL: return global()->type();
     case EXTERN_TABLE: return table()->type();
     case EXTERN_MEMORY: return memory()->type();
+    default: assert(false);
   }
 }
 
@@ -1520,10 +1530,11 @@ struct FuncData {
     Func::callback callback;
     Func::callback_with_env callback_with_env;
   };
+  void (*finalizer)(void*);
   void* env;
 
   FuncData(Store* store, const FuncType* type, Kind kind) :
-    store(store), type(type->copy()), kind(kind)
+    store(store), type(type->copy()), kind(kind), finalizer(nullptr)
   {
     stats.make(Stats::FUNCDATA_FUNCTYPE, nullptr);
     stats.make(Stats::FUNCDATA_VALTYPE, nullptr, Stats::OWN, type->params().size());
@@ -1538,6 +1549,7 @@ struct FuncData {
     stats.free(Stats::FUNCDATA_VALTYPE, nullptr, Stats::OWN, type->results().size());
     if (type->params().get()) stats.free(Stats::FUNCDATA_VALTYPE, nullptr, Stats::VEC);
     if (type->results().get()) stats.free(Stats::FUNCDATA_VALTYPE, nullptr, Stats::VEC);
+    if (finalizer) (*finalizer)(env);
   }
 
   static void v8_callback(const v8::FunctionCallbackInfo<v8::Value>&);
@@ -1626,6 +1638,7 @@ auto Func::make(
   auto data = new FuncData(store, type, FuncData::CALLBACK_WITH_ENV);
   data->callback_with_env = callback;
   data->env = env;
+  data->finalizer = finalizer;
   return make_func(store, data);
 }
 
@@ -1703,7 +1716,8 @@ void FuncData::v8_callback(const v8::FunctionCallbackInfo<v8::Value>& info) {
   auto& param_types = self->type->params();
   auto& result_types = self->type->results();
 
-  assert(param_types.size() == info.Length());
+  assert(info.Length() >= 0);
+  assert(param_types.size() == static_cast<size_t>(info.Length()));
 
   // TODO: cache params and result arrays per thread.
   auto args = new Val[param_types.size()];
@@ -1721,6 +1735,8 @@ void FuncData::v8_callback(const v8::FunctionCallbackInfo<v8::Value>& info) {
 
   if (trap) {
     isolate->ThrowException(impl(trap.get())->v8_object());
+    delete[] args;
+    delete[] results;
     return;
   }
 
@@ -1733,6 +1749,9 @@ void FuncData::v8_callback(const v8::FunctionCallbackInfo<v8::Value>& info) {
   } else {
     UNIMPLEMENTED("multiple results");
   }
+
+  delete[] args;
+  delete[] results;
 }
 
 void FuncData::finalize_func_data(void* data) {
