@@ -1,3 +1,4 @@
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -10,7 +11,7 @@
 const int iterations = 100000;
 
 void finalize(void* data) {
-  int i = (int)data;
+  int i = (intptr_t)data;
   if (i % (iterations / 10) == 0) printf("Finalizing #%d...\n", i);
 }
 
